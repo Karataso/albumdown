@@ -14,6 +14,7 @@ Examples:
 import argparse
 import os
 import platform
+import random
 import re
 import subprocess
 import sys
@@ -264,7 +265,13 @@ def embed_metadata(filepath: Path, metadata: dict, track_num: int, title: str) -
 
 # ─── Download ─────────────────────────────────────────────────────
 
-def download_album(metadata: dict, album_dir: Path, quality: int = 0) -> dict:
+def download_album(
+    metadata: dict,
+    album_dir: Path,
+    quality: int = 0,
+    safe: bool = False,
+    cookies: str | None = None,
+) -> dict:
     """Download all tracks. Returns stats dict."""
     entries = metadata["entries"]
     total = len(entries)
@@ -339,6 +346,17 @@ def download_album(metadata: dict, album_dir: Path, quality: int = 0) -> dict:
                 "extractor_retries": 3,
             }
 
+            # Cookies (authenticated session)
+            if cookies:
+                ydl_opts["cookiefile"] = cookies
+
+            # Safe mode — aggressive delays to avoid bot detection
+            if safe:
+                ydl_opts["sleep_requests"] = 3        # 3s between metadata requests
+                ydl_opts["sleep_interval"] = 5        # min 5s before each download
+                ydl_opts["max_sleep_interval"] = 15   # max 15s (random between)
+                ydl_opts["fragment_retries"] = 2      # fewer retries = fewer requests
+
             def make_hook(trk_num, trk_total, trk_title, pbar, task_id):
                 def hook(d):
                     if d["status"] == "downloading":
@@ -400,9 +418,18 @@ def download_album(metadata: dict, album_dir: Path, quality: int = 0) -> dict:
                         stats["failed"] += 1
                         stats["failed_tracks"].append(f"{track_num:02d}. {title}")
 
-            # Small delay between tracks to avoid rate limiting
+            # Delay between tracks to avoid rate limiting
             if downloaded and i < total - 1:
-                time.sleep(1.5)
+                if safe:
+                    # Safe mode: longer, random wait with visible message
+                    wait = random.uniform(6, 12)
+                    progress.update(
+                        dl_task,
+                        description=f"⏳ Waiting {wait:.0f}s to avoid bot detection...",
+                    )
+                    time.sleep(wait)
+                else:
+                    time.sleep(1.5)
 
             progress.update(dl_task, advance=1)
 
@@ -514,6 +541,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip the confirmation prompt before downloading",
     )
+    parser.add_argument(
+        "--safe",
+        action="store_true",
+        help="Slower, gentler downloads — adds delays between requests to avoid bot detection",
+    )
+    parser.add_argument(
+        "--cookies",
+        metavar="FILE",
+        default=None,
+        help="Path to a cookies.txt file (Netscape format) for authenticated downloads",
+    )
     return parser.parse_args()
 
 
@@ -558,7 +596,12 @@ def main():
 
     # Download
     start = time.time()
-    stats = download_album(metadata, album_dir, quality=args.quality)
+    stats = download_album(
+        metadata, album_dir,
+        quality=args.quality,
+        safe=args.safe,
+        cookies=args.cookies,
+    )
     elapsed = time.time() - start
 
     # Summary

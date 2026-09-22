@@ -74,7 +74,35 @@ Each MP3 file has ID3 tags embedded: title, artist, album, and track number.
 | `-o, --output DIR` | Output directory | `~/Music` |
 | `--quality N` | MP3 quality (0=best, 10=worst) | `0` |
 | `--no-confirm` | Skip the yes/no prompt | off |
+| `--safe` | Slower, gentler downloads (see below) | off |
+| `--cookies FILE` | Use a cookies.txt for authenticated downloads | none |
 | `-h, --help` | Show help | — |
+
+## Safe Mode
+
+If you're getting "Sign in to confirm you're not a bot" or 403 errors, YouTube is flagging your requests. Use `--safe`:
+
+```bash
+./albumdown "URL" --safe
+```
+
+This adds aggressive delays:
+- 3 seconds between metadata requests
+- Random 5–15 second pause before each download
+- Random 6–12 second wait between tracks (with a visible countdown)
+- Fewer retries (fewer requests = less suspicion)
+
+Slower, but much less likely to trip bot detection.
+
+## Cookies (authenticated downloads)
+
+If bot detection persists, you can pass YouTube cookies:
+
+```bash
+./albumdown "URL" --cookies cookies.txt
+```
+
+> ⚠️ **Warning:** Cookies tie downloads to a Google account. YouTube can temporarily restrict accounts that download heavily. Use a **throwaway account**, never your main one. Export cookies from a private/incognito window using a cookies.txt extension, then close the window.
 
 ## Notes
 
