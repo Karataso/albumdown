@@ -2,18 +2,35 @@
 
 Download entire YouTube Music albums as MP3s with one command.
 
-## Requirements
+## Installation
 
-- Python 3.10+
-- ffmpeg
+Clone the repo and `cd` into it:
 
-That's it. Dependencies are installed automatically on first run.
+```bash
+git clone https://github.com/Karataso/albumdown.git
+cd albumdown
+```
+
+**Linux / macOS:**
+```bash
+./albumdown "https://music.youtube.com/playlist?list=PLxxxxx"
+```
+
+**Windows:**
+```bash
+python albumdown "https://music.youtube.com/playlist?list=PLxxxxx"
+```
+
+That's it. First run automatically installs dependencies into a local `.venv/` — nothing global gets touched.
+
+> **Note:** ffmpeg must be installed (used for MP3 conversion).
+> - Arch: `sudo pacman -S ffmpeg`
+> - Debian/Ubuntu: `sudo apt install ffmpeg`
+> - Windows: [ffmpeg.org/download](https://ffmpeg.org/download.html)
 
 ## Usage
 
 ```bash
-cd ~/Documents/albumProject
-
 # Basic — downloads to ~/Music/
 ./albumdown "https://music.youtube.com/playlist?list=PLxxxxx"
 
@@ -26,8 +43,6 @@ cd ~/Documents/albumProject
 # Set MP3 quality (0=best, 10=worst, default: 0)
 ./albumdown "https://music.youtube.com/playlist?list=PLxxxxx" --quality 3
 ```
-
-First run creates a `.venv/` and installs `yt-dlp`, `rich`, and `mutagen` automatically.
 
 ## What it does
 
@@ -61,3 +76,4 @@ Each MP3 file has ID3 tags embedded: title, artist, album, and track number.
 - Failed tracks are reported at the end
 - Works with both `youtube.com` and `music.youtube.com` playlist URLs
 - Artist names are cleaned automatically (removes "- Topic", "- Album" suffixes)
+- Linux, macOS, and Windows are supported

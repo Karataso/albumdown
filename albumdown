@@ -3,7 +3,8 @@
 albumdown — Download entire YouTube Music albums as MP3s.
 
 Usage:
-    albumdown <URL> [options]
+    albumdown <URL> [options]       (Linux/macOS)
+    python albumdown <URL> [options] (Windows)
 
 Examples:
     albumdown "https://music.youtube.com/playlist?list=PLxxxxx"
@@ -12,10 +13,10 @@ Examples:
 
 import argparse
 import os
+import platform
 import re
 import subprocess
 import sys
-import time
 import venv
 from pathlib import Path
 
@@ -25,25 +26,33 @@ from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _VENV_DIR = _SCRIPT_DIR / ".venv"
-_VENV_PYTHON = _VENV_DIR / "bin" / "python"
+_IS_WINDOWS = platform.system() == "Windows"
+_VENV_PYTHON = (
+    _VENV_DIR / "Scripts" / "python.exe" if _IS_WINDOWS
+    else _VENV_DIR / "bin" / "python"
+)
 _DEPS = ["yt-dlp", "rich", "mutagen"]
 
 
 def _ensure_venv():
     """Create venv + install deps if missing, then re-exec with venv python."""
-    # If venv python doesn't exist yet — first run
     if not _VENV_PYTHON.exists():
         print("📦 First run — setting up dependencies...")
         venv.create(str(_VENV_DIR), with_pip=True, clear=False)
         subprocess.run(
-            [_VENV_PYTHON, "-m", "pip", "install", "--quiet", *_DEPS],
+            [str(_VENV_PYTHON), "-m", "pip", "install", "--quiet", *_DEPS],
             check=True,
         )
         print("✅ Ready!\n")
 
-    # If we're not running inside the venv, re-exec with it
+    # If we're not running inside the venv, re-launch with it
     if Path(sys.executable).resolve() != _VENV_PYTHON.resolve():
-        os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON)] + sys.argv)
+        if _IS_WINDOWS:
+            # os.execv doesn't work reliably on Windows — spawn and exit
+            result = subprocess.run([str(_VENV_PYTHON), *sys.argv])
+            sys.exit(result.returncode)
+        else:
+            os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON)] + sys.argv)
 
 
 _ensure_venv()
