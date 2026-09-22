@@ -11,7 +11,7 @@ git clone https://github.com/Karataso/albumdown.git
 cd albumdown
 ```
 
-**Linux / macOS:**
+**Linux:**
 ```bash
 ./albumdown "https://music.youtube.com/playlist?list=PLxxxxx"
 ```
@@ -20,6 +20,12 @@ cd albumdown
 ```bash
 python albumdown "https://music.youtube.com/playlist?list=PLxxxxx"
 ```
+
+**macOS:**
+```bash
+./albumdown "https://music.youtube.com/playlist?list=PLxxxxx"
+```
+> *Should work — same as Linux — but hasn't been tested on a real Mac.*
 
 That's it. First run automatically installs dependencies into a local `.venv/` — nothing global gets touched.
 
@@ -76,4 +82,5 @@ Each MP3 file has ID3 tags embedded: title, artist, album, and track number.
 - Failed tracks are reported at the end
 - Works with both `youtube.com` and `music.youtube.com` playlist URLs
 - Artist names are cleaned automatically (removes "- Topic", "- Album" suffixes)
-- Linux, macOS, and Windows are supported
+- Linux and Windows are supported (tested)
+- macOS should work but is untested
