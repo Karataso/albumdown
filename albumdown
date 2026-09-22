@@ -411,6 +411,38 @@ def display_summary(stats: dict, album_dir: Path) -> None:
 
 # ─── Main ─────────────────────────────────────────────────────────
 
+def _get_music_dir() -> Path:
+    """Get the user's Music folder for the current platform."""
+    if _IS_WINDOWS:
+        # Ask Windows where the Music folder actually is
+        # (handles users who moved it to another drive)
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            _FOLDERID_Music = ctypes.c_char_p(
+                b"{4BD8D571-6D19-48D3-BE97-422220080E43}"
+            )
+            _SHGetKnownFolderPath = ctypes.windll.shell32.SHGetKnownFolderPath
+            _SHGetKnownFolderPath.argtypes = [
+                ctypes.c_char_p, wintypes.DWORD, wintypes.HANDLE,
+                ctypes.POINTER(ctypes.c_wchar_p),
+            ]
+            _SHGetKnownFolderPath.restype = ctypes.HRESULT
+
+            path_ptr = ctypes.c_wchar_p()
+            result = _SHGetKnownFolderPath(_FOLDERID_Music, 0, 0, ctypes.byref(path_ptr))
+            if result == 0:  # S_OK
+                return Path(path_ptr.value)
+        except Exception:
+            pass
+        # Fallback
+        return Path.home() / "Music"
+    else:
+        # Linux / macOS both use ~/Music
+        return Path.home() / "Music"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="albumdown",
@@ -426,7 +458,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("url", help="YouTube Music or YouTube playlist URL")
     parser.add_argument(
         "-o", "--output",
-        default=str(Path.home() / "Music"),
+        default=str(_get_music_dir()),
         help="Output directory (default: ~/Music)",
     )
     parser.add_argument(
