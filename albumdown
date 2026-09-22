@@ -463,7 +463,23 @@ def _get_music_dir() -> Path:
         # Fallback
         return Path.home() / "Music"
     else:
-        # Linux / macOS both use ~/Music
+        # Linux / macOS — read XDG user-dirs config (handles localized folders)
+        # e.g. ~/Musica on Spanish systems, ~/Musik on German, etc.
+        try:
+            xdg_file = Path.home() / ".config" / "user-dirs.dirs"
+            if xdg_file.exists():
+                for line in xdg_file.read_text().splitlines():
+                    if line.startswith("XDG_MUSIC_DIR"):
+                        # Format: XDG_MUSIC_DIR="$HOME/Música"
+                        _, _, value = line.partition("=")
+                        value = value.strip().strip('"')
+                        value = value.replace("$HOME", str(Path.home()))
+                        path = Path(value)
+                        if path.is_dir():
+                            return path
+        except Exception:
+            pass
+        # Fallback
         return Path.home() / "Music"
 
 
