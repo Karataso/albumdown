@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""
+albumdown — Download entire YouTube Music albums as MP3s.
+
+Usage:
+    albumdown <URL> [options]
+
+Examples:
+    albumdown "https://music.youtube.com/playlist?list=PLxxxxx"
+    albumdown "https://youtube.com/playlist?list=PLxxxxx" -o ~/Downloads
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+import venv
+from pathlib import Path
+
+# ─── Auto-bootstrapping venv ─────────────────────────────────────
+# On first run, creates .venv/, installs deps, re-launches itself.
+# User never sees any of this — just runs ./albumdown and it works.
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_VENV_DIR = _SCRIPT_DIR / ".venv"
+_VENV_PYTHON = _VENV_DIR / "bin" / "python"
+_DEPS = ["yt-dlp", "rich", "mutagen"]
+
+
+def _ensure_venv():
+    """Create venv + install deps if missing, then re-exec with venv python."""
+    # If venv python doesn't exist yet — first run
+    if not _VENV_PYTHON.exists():
+        print("📦 First run — setting up dependencies...")
+        venv.create(str(_VENV_DIR), with_pip=True, clear=False)
+        subprocess.run(
+            [_VENV_PYTHON, "-m", "pip", "install", "--quiet", *_DEPS],
+            check=True,
+        )
+        print("✅ Ready!\n")
+
+    # If we're not running inside the venv, re-exec with it
+    if Path(sys.executable).resolve() != _VENV_PYTHON.resolve():
+        os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON)] + sys.argv)
+
+
+_ensure_venv()
+
+# ─── Imports (guaranteed to exist after bootstrapping) ────────────
+
+import yt_dlp
+from rich.console import Console
+from rich.table import Table
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    BarColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    MofNCompleteColumn,
+)
+from rich.panel import Panel
+from rich.prompt import Confirm
+from rich.text import Text
+from rich import box
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, ID3NoHeaderError
+
+console = Console()
+
+# ─── URL Validation ───────────────────────────────────────────────
+
+YOUTUBE_PLAYLIST_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?"
+    r"(?:music\.)?youtube\.com/(?:playlist\?list=|watch\?.*list=)"
+    r"([A-Za-z0-9_-]+)"
+)
+
+
+def validate_url(url: str) -> str | None:
+    """Extract playlist ID from a YouTube/Music URL. Returns None if invalid."""
+    m = YOUTUBE_PLAYLIST_RE.search(url)
+    return m.group(1) if m else None
+
+
+def is_album_url(url: str) -> bool:
+    return validate_url(url) is not None
+
+
+# ─── Metadata Extraction ──────────────────────────────────────────
+
+def fetch_metadata(url: str) -> dict:
+    """Fetch playlist metadata without downloading anything."""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": False,
+        "skip_download": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=False)
+        except yt_dlp.utils.DownloadError as e:
+            console.print("[bold red]Error:[/] Could not fetch playlist info.")
+            console.print(f"[dim]{e}[/]")
+            sys.exit(1)
+
+    if not info:
+        console.print("[bold red]Error:[/] No metadata returned.")
+        sys.exit(1)
+
+    # Single video — treat as 1-track "album"
+    if info.get("_type") == "video" or not info.get("entries"):
+        entries = [info]
+        album_name = info.get("title", "Unknown Album")
+        artist = _clean_artist(
+            info.get("uploader")
+            or info.get("channel")
+            or "Unknown Artist"
+        )
+    else:
+        entries = list(info.get("entries", []))
+        album_name = _clean_album(info.get("title", "Unknown Album"))
+        artist = _clean_artist(
+            info.get("uploader")
+            or info.get("channel")
+            or ""
+        )
+        # Fallback: try first entry's uploader
+        if not artist or artist.lower() in ("unknown artist", ""):
+            first = entries[0] if entries else {}
+            artist = _clean_artist(
+                first.get("uploader")
+                or first.get("channel")
+                or "Unknown Artist"
+            )
+
+    valid_entries = [e for e in entries if e is not None]
+
+    return {
+        "album": album_name,
+        "artist": artist,
+        "entries": valid_entries,
+        "url": url,
+    }
+
+
+def _clean_artist(name: str) -> str:
+    """Strip common suffixes that YouTube adds to artist names."""
+    if not name:
+        return "Unknown Artist"
+    # Remove "- Topic", "- Album", "- Single" suffixes
+    name = re.sub(r"\s*-\s*(Topic|Album|Single|VEVO)$", "", name, flags=re.IGNORECASE)
+    name = name.strip()
+    return name or "Unknown Artist"
+
+
+def _clean_album(name: str) -> str:
+    """Clean album name."""
+    if not name:
+        return "Unknown Album"
+    return name.strip()
+
+
+# ─── Display ──────────────────────────────────────────────────────
+
+def format_duration(seconds: int | float | None) -> str:
+    if not seconds:
+        return "??:??"
+    total = int(seconds)
+    h, remainder = divmod(total, 3600)
+    m, s = divmod(remainder, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def display_tracklist(metadata: dict) -> None:
+    album = metadata["album"]
+    artist = metadata["artist"]
+    entries = metadata["entries"]
+
+    total_duration = sum(e.get("duration") or 0 for e in entries)
+    track_count = len(entries)
+
+    header = Text()
+    header.append("🎵 ", style="bold")
+    header.append(artist, style="bold cyan")
+    header.append(" — ", style="dim")
+    header.append(album, style="bold white")
+    header.append(
+        f"\n   {track_count} track{'s' if track_count != 1 else ''} • {format_duration(total_duration)} total",
+        style="dim",
+    )
+
+    console.print()
+    console.print(Panel(header, border_style="blue", box=box.ROUNDED))
+
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold green", padding=(0, 1))
+    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("Title", style="white", ratio=3)
+    table.add_column("Duration", style="dim", justify="right")
+
+    for i, entry in enumerate(entries, 1):
+        title = entry.get("title") or entry.get("fulltitle") or f"Track {i}"
+        duration = format_duration(entry.get("duration"))
+        table.add_row(f"{i:02d}", title, duration)
+
+    console.print(table)
+    console.print()
+
+
+# ─── File System ──────────────────────────────────────────────────
+
+def _sanitize(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r"_+", "_", name).strip("_. ")
+    return name or "Unknown"
+
+
+def make_output_dir(metadata: dict, output_base: str) -> Path:
+    """Create ~/Music/{Artist}/{Album}/ structure."""
+    artist = _sanitize(metadata["artist"])
+    album = _sanitize(metadata["album"])
+    album_dir = Path(output_base) / artist / album
+    album_dir.mkdir(parents=True, exist_ok=True)
+    return album_dir
+
+
+# ─── Metadata Embedding ───────────────────────────────────────────
+
+def embed_metadata(filepath: Path, metadata: dict, track_num: int, title: str) -> bool:
+    """Embed ID3 tags into an MP3 file. Returns True on success."""
+    try:
+        try:
+            audio = MP3(str(filepath), ID3=ID3)
+        except ID3NoHeaderError:
+            audio = MP3(str(filepath))
+            audio.add_tags()
+
+        audio.tags.add(TIT2(encoding=3, text=[title]))
+        audio.tags.add(TPE1(encoding=3, text=[metadata["artist"]]))
+        audio.tags.add(TALB(encoding=3, text=[metadata["album"]]))
+        audio.tags.add(TRCK(encoding=3, text=[str(track_num)]))
+        audio.save()
+        return True
+    except Exception:
+        return False
+
+
+# ─── Download ─────────────────────────────────────────────────────
+
+def download_album(metadata: dict, album_dir: Path, quality: int = 0) -> dict:
+    """Download all tracks. Returns stats dict."""
+    entries = metadata["entries"]
+    total = len(entries)
+    stats = {"success": 0, "skipped": 0, "failed": 0, "failed_tracks": []}
+
+    total_done = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=40),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        dl_task = progress.add_task("Preparing...", total=total)
+
+        for i, entry in enumerate(entries):
+            track_num = i + 1
+
+            if entry is None:
+                stats["failed"] += 1
+                stats["failed_tracks"].append(f"Track {track_num} (metadata unavailable)")
+                progress.update(dl_task, advance=1)
+                continue
+
+            title = entry.get("title") or entry.get("fulltitle") or f"Track {track_num}"
+            entry_url = entry.get("url") or entry.get("webpage_url")
+            if not entry_url:
+                vid_id = entry.get("id")
+                if vid_id:
+                    entry_url = f"https://www.youtube.com/watch?v={vid_id}"
+                else:
+                    stats["failed"] += 1
+                    stats["failed_tracks"].append(f"{track_num:02d}. {title}")
+                    progress.update(dl_task, advance=1)
+                    continue
+
+            # Check if file already exists
+            safe_title = _sanitize(title)
+            expected_file = album_dir / f"{track_num:02d}. {safe_title}.mp3"
+            if expected_file.exists():
+                stats["skipped"] += 1
+                progress.update(dl_task, advance=1)
+                continue
+
+            progress.update(dl_task, description=f"[{track_num}/{total}] {title[:50]}")
+
+            # Output template: just the temp name, we'll rename after
+            tmp_template = str(album_dir / f"__tmp_{track_num}__.%(ext)s")
+
+            ydl_opts = {
+                "format": "bestaudio/best",
+                "outtmpl": tmp_template,
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": str(quality),
+                    }
+                ],
+                "writethumbnail": False,
+                "writeinfojson": False,
+                "ignoreerrors": True,
+                "no_warnings": True,
+                "quiet": True,
+                "noprogress": True,
+            }
+
+            def make_hook(trk_num, trk_total, trk_title, pbar, task_id):
+                def hook(d):
+                    if d["status"] == "downloading":
+                        total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                        downloaded = d.get("downloaded_bytes") or 0
+                        speed = d.get("speed")
+                        if total_bytes and speed:
+                            speed_str = f"{speed / 1_000_000:.1f}MB/s" if speed > 1_000_000 else f"{speed / 1_000:.0f}KB/s"
+                            pbar.update(task_id, description=f"[{trk_num}/{trk_total}] {trk_title[:45]} • {speed_str}")
+                    elif d["status"] == "finished":
+                        pbar.update(task_id, description=f"[{trk_num}/{trk_total}] Converting {trk_title[:45]}...")
+                return hook
+
+            ydl_opts["progress_hooks"] = [make_hook(track_num, total, title, progress, dl_task)]
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([entry_url])
+
+                # Find the downloaded temp file and rename it
+                tmp_mp3 = album_dir / f"__tmp_{track_num}__.mp3"
+                final_mp3 = album_dir / f"{track_num:02d}. {safe_title}.mp3"
+
+                if tmp_mp3.exists():
+                    tmp_mp3.rename(final_mp3)
+                else:
+                    # yt-dlp might have named it differently — find it
+                    candidates = list(album_dir.glob(f"__tmp_{track_num}*.mp3"))
+                    if candidates:
+                        candidates[0].rename(final_mp3)
+
+                # Embed metadata
+                if final_mp3.exists():
+                    embed_metadata(final_mp3, metadata, track_num, title)
+
+                stats["success"] += 1
+
+            except Exception as e:
+                stats["failed"] += 1
+                stats["failed_tracks"].append(f"{track_num:02d}. {title}")
+                # Cleanup temp files on failure
+                for f in album_dir.glob(f"__tmp_{track_num}*"):
+                    f.unlink(missing_ok=True)
+
+            progress.update(dl_task, advance=1)
+
+    return stats
+
+
+# ─── Summary ──────────────────────────────────────────────────────
+
+def display_summary(stats: dict, album_dir: Path) -> None:
+    console.print()
+    lines = []
+    if stats["success"] > 0:
+        lines.append(f"[green]✓ {stats['success']} downloaded[/]")
+    if stats["skipped"] > 0:
+        lines.append(f"[yellow]● {stats['skipped']} skipped (already existed)[/]")
+    if stats["failed"] > 0:
+        lines.append(f"[red]✗ {stats['failed']} failed[/]")
+
+    summary = " • ".join(lines)
+    console.print(summary)
+    console.print(f"[dim]📁 {album_dir}[/]")
+
+    if stats["failed_tracks"]:
+        console.print("\n[bold red]Failed tracks:[/]")
+        for t in stats["failed_tracks"]:
+            console.print(f"  [dim]• {t}[/]")
+
+    console.print()
+
+
+# ─── Main ─────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="albumdown",
+        description="Download entire YouTube Music albums as MP3s.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            '  albumdown "https://music.youtube.com/playlist?list=PLxxxxx"\n'
+            '  albumdown "https://youtube.com/playlist?list=PLxxxxx" -o ~/Downloads\n'
+            '  albumdown "https://music.youtube.com/playlist?list=PLxxxxx" --no-confirm'
+        ),
+    )
+    parser.add_argument("url", help="YouTube Music or YouTube playlist URL")
+    parser.add_argument(
+        "-o", "--output",
+        default=str(Path.home() / "Music"),
+        help="Output directory (default: ~/Music)",
+    )
+    parser.add_argument(
+        "--quality",
+        type=int,
+        default=0,
+        choices=range(0, 11),
+        metavar="0-10",
+        help="MP3 quality: 0=best, 10=worst (default: 0)",
+    )
+    parser.add_argument(
+        "--no-confirm",
+        action="store_true",
+        help="Skip the confirmation prompt before downloading",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if not is_album_url(args.url):
+        console.print("[bold red]Error:[/] Invalid URL.")
+        console.print("  Please provide a YouTube or YouTube Music playlist URL.")
+        console.print("  [dim]e.g. https://music.youtube.com/playlist?list=PLxxxxx[/]")
+        sys.exit(1)
+
+    output_base = os.path.expanduser(args.output)
+    if not os.path.isdir(output_base):
+        console.print(f"[bold red]Error:[/] Output directory does not exist: {output_base}")
+        sys.exit(1)
+
+    # Fetch metadata
+    with console.status("[bold blue]Fetching album info...", spinner="dots"):
+        metadata = fetch_metadata(args.url)
+
+    if not metadata["entries"]:
+        console.print("[bold red]Error:[/] No tracks found in this playlist.")
+        sys.exit(1)
+
+    # Display tracklist
+    display_tracklist(metadata)
+
+    # Confirm
+    if not args.no_confirm:
+        track_count = len(metadata["entries"])
+        if not Confirm.ask(
+            f"[bold]Download {track_count} track{'s' if track_count != 1 else ''}?",
+            default=True,
+        ):
+            console.print("[dim]Cancelled.[/]")
+            sys.exit(0)
+
+    # Create output directory
+    album_dir = make_output_dir(metadata, output_base)
+    console.print(f"[dim]📁 Saving to: {album_dir}[/]\n")
+
+    # Download
+    start = time.time()
+    stats = download_album(metadata, album_dir, quality=args.quality)
+    elapsed = time.time() - start
+
+    # Summary
+    display_summary(stats, album_dir)
+    console.print(f"[dim]Finished in {format_duration(elapsed)}[/]")
+
+
+if __name__ == "__main__":
+    main()
