@@ -335,6 +335,8 @@ def download_album(metadata: dict, album_dir: Path, quality: int = 0) -> dict:
                 "no_warnings": True,
                 "quiet": True,
                 "noprogress": True,
+                "retries": 3,
+                "extractor_retries": 3,
             }
 
             def make_hook(trk_num, trk_total, trk_title, pbar, task_id):
@@ -352,34 +354,55 @@ def download_album(metadata: dict, album_dir: Path, quality: int = 0) -> dict:
 
             ydl_opts["progress_hooks"] = [make_hook(track_num, total, title, progress, dl_task)]
 
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([entry_url])
+            # Retry logic with exponential backoff
+            max_retries = 3
+            downloaded = False
 
-                # Find the downloaded temp file and rename it
-                tmp_mp3 = album_dir / f"__tmp_{track_num}__.mp3"
-                final_mp3 = album_dir / f"{track_num:02d}. {safe_title}.mp3"
+            for attempt in range(max_retries):
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([entry_url])
 
-                if tmp_mp3.exists():
-                    tmp_mp3.rename(final_mp3)
-                else:
-                    # yt-dlp might have named it differently — find it
-                    candidates = list(album_dir.glob(f"__tmp_{track_num}*.mp3"))
-                    if candidates:
-                        candidates[0].rename(final_mp3)
+                    # Find the downloaded temp file and rename it
+                    tmp_mp3 = album_dir / f"__tmp_{track_num}__.mp3"
+                    final_mp3 = album_dir / f"{track_num:02d}. {safe_title}.mp3"
 
-                # Embed metadata
-                if final_mp3.exists():
-                    embed_metadata(final_mp3, metadata, track_num, title)
+                    if tmp_mp3.exists():
+                        tmp_mp3.rename(final_mp3)
+                    else:
+                        # yt-dlp might have named it differently — find it
+                        candidates = list(album_dir.glob(f"__tmp_{track_num}*.mp3"))
+                        if candidates:
+                            candidates[0].rename(final_mp3)
 
-                stats["success"] += 1
+                    # Embed metadata
+                    if final_mp3.exists():
+                        embed_metadata(final_mp3, metadata, track_num, title)
 
-            except Exception as e:
-                stats["failed"] += 1
-                stats["failed_tracks"].append(f"{track_num:02d}. {title}")
-                # Cleanup temp files on failure
-                for f in album_dir.glob(f"__tmp_{track_num}*"):
-                    f.unlink(missing_ok=True)
+                    stats["success"] += 1
+                    downloaded = True
+                    break
+
+                except Exception as e:
+                    # Cleanup temp files before retry
+                    for f in album_dir.glob(f"__tmp_{track_num}*"):
+                        f.unlink(missing_ok=True)
+
+                    if attempt < max_retries - 1:
+                        # Exponential backoff: 2s, 4s, 8s...
+                        wait = 2 ** (attempt + 1)
+                        progress.update(
+                            dl_task,
+                            description=f"[{track_num}/{total}] Retry {attempt + 1}/{max_retries} in {wait}s — {title[:35]}",
+                        )
+                        time.sleep(wait)
+                    else:
+                        stats["failed"] += 1
+                        stats["failed_tracks"].append(f"{track_num:02d}. {title}")
+
+            # Small delay between tracks to avoid rate limiting
+            if downloaded and i < total - 1:
+                time.sleep(1.5)
 
             progress.update(dl_task, advance=1)
 
