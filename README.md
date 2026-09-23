@@ -79,7 +79,14 @@ Track numbers come from the playlist order (YouTube Music stores albums as playl
 | `--safe` | Slower, gentler downloads (see below) | off |
 | `--cookies FILE` | Use a cookies.txt for authenticated downloads | none |
 | `--lyrics` | Fetch and archive lyrics (see below) | off |
+| `--no-art` | Skip embedding album cover art | off |
 | `-h, --help` | Show help | — |
+
+## Cover Art
+
+On by default. The **album's own cover** (from the playlist) is downloaded once and embedded into every MP3 — one clean, consistent cover for the whole album instead of screwey per-video thumbnails with text overlays. Per-video thumbnails are only used as a last resort if the album has no art.
+
+Disable with `--no-art`. Works as a backfill too: run it on an already-downloaded album and it only adds art to files missing it.
 
 ## Lyrics
 
@@ -95,6 +102,12 @@ Fetches lyrics from [LRCLIB](https://lrclib.net) (free, no API key) and archives
 Matching is duration- and artist-aware to avoid attaching wrong-song lyrics. You can also run it on an album you've already downloaded — it backfills missing lyrics without re-downloading anything.
 
 > Why not Musixmatch? Their free API tier only returns 30% lyric snippets; full lyrics require a paid license. LRCLIB is free and complete.
+
+### Players that show the lyrics
+
+- **Quod Libet** (`quodlibet`) — enable the *Display lyrics* plugin: shows embedded lyrics in a panel next to the song
+- **Strawberry** — shows embedded plain lyrics
+- **mpv + [mpv-lrc](https://github.com/guidocella/mpv-lrc)** — displays the `.lrc` files as a synced overlay that follows playback
 
 ## Safe Mode
 
