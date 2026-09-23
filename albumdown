@@ -12,6 +12,7 @@ Examples:
 """
 
 import argparse
+import json
 import os
 import platform
 import random
@@ -19,6 +20,8 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 import venv
 from pathlib import Path
 
@@ -78,7 +81,7 @@ from rich.prompt import Confirm
 from rich.text import Text
 from rich import box
 from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, ID3NoHeaderError
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, USLT, ID3NoHeaderError
 
 console = Console()
 
@@ -127,23 +130,41 @@ def fetch_metadata(url: str) -> dict:
     # Single video — treat as 1-track "album"
     if info.get("_type") == "video" or not info.get("entries"):
         entries = [info]
-        album_name = info.get("title", "Unknown Album")
-        artist = _clean_artist(
+        album_name = _clean_album(info.get("album") or info.get("title"))
+        artist = _entry_artist(info) or _clean_artist(
             info.get("uploader")
             or info.get("channel")
             or "Unknown Artist"
         )
     else:
         entries = list(info.get("entries", []))
-        album_name = _clean_album(info.get("title", "Unknown Album"))
-        artist = _clean_artist(
-            info.get("uploader")
-            or info.get("channel")
-            or ""
-        )
+        valid = [e for e in entries if e is not None]
+
+        # Album: the per-entry tag is cleaner than the playlist title
+        # (YouTube Music titles often come prefixed: "Album - Lámina Once")
+        album_name = ""
+        for e in valid:
+            if e.get("album"):
+                album_name = _clean_album(e["album"])
+                break
+        if not album_name:
+            album_name = _clean_playlist_title(info.get("title", "Unknown Album"))
+
+        # Artist: per-entry tag first, then playlist uploader/channel
+        artist = ""
+        for e in valid:
+            artist = _entry_artist(e)
+            if artist:
+                break
+        if not artist:
+            artist = _clean_artist(
+                info.get("uploader")
+                or info.get("channel")
+                or ""
+            )
         # Fallback: try first entry's uploader
         if not artist or artist.lower() in ("unknown artist", ""):
-            first = entries[0] if entries else {}
+            first = valid[0] if valid else {}
             artist = _clean_artist(
                 first.get("uploader")
                 or first.get("channel")
@@ -151,6 +172,14 @@ def fetch_metadata(url: str) -> dict:
             )
 
     valid_entries = [e for e in entries if e is not None]
+
+    # Track numbers: YouTube Music has no track-number field (its "track"
+    # key holds the song title) — the order lives in playlist_index.
+    # Normalize it so display, filenames and the ID3 TRCK tag all agree.
+    for idx, e in enumerate(valid_entries, 1):
+        pi = e.get("playlist_index")
+        if not isinstance(pi, int) or pi < 1:
+            e["playlist_index"] = idx
 
     return {
         "album": album_name,
@@ -175,6 +204,24 @@ def _clean_album(name: str) -> str:
     if not name:
         return "Unknown Album"
     return name.strip()
+
+
+def _clean_playlist_title(name: str) -> str:
+    """Strip the prefixes YouTube Music puts on playlist titles ('Album - X')."""
+    name = (name or "").strip()
+    name = re.sub(r"^(full\s+album|album|lp|ep|single)\s*[-–—:]\s*", "", name, flags=re.IGNORECASE)
+    return name.strip() or "Unknown Album"
+
+
+def _entry_artist(entry: dict) -> str:
+    """Per-song artist from its own metadata ('' if unavailable)."""
+    artists = entry.get("artists")
+    if isinstance(artists, list) and artists and artists[0]:
+        return _clean_artist(str(artists[0]))
+    a = entry.get("artist") or entry.get("creator")
+    if a:
+        return _clean_artist(str(a).split(",")[0].strip())
+    return ""
 
 
 # ─── Display ──────────────────────────────────────────────────────
@@ -219,7 +266,10 @@ def display_tracklist(metadata: dict) -> None:
     for i, entry in enumerate(entries, 1):
         title = entry.get("title") or entry.get("fulltitle") or f"Track {i}"
         duration = format_duration(entry.get("duration"))
-        table.add_row(f"{i:02d}", title, duration)
+        num = entry.get("playlist_index")
+        if not isinstance(num, int):
+            num = i
+        table.add_row(f"{num:02d}", title, duration)
 
     console.print(table)
     console.print()
@@ -244,7 +294,8 @@ def make_output_dir(metadata: dict, output_base: str) -> Path:
 
 # ─── Metadata Embedding ───────────────────────────────────────────
 
-def embed_metadata(filepath: Path, metadata: dict, track_num: int, title: str) -> bool:
+def embed_metadata(filepath: Path, metadata: dict, track_num: int, title: str,
+                    artist: str | None = None) -> bool:
     """Embed ID3 tags into an MP3 file. Returns True on success."""
     try:
         try:
@@ -254,13 +305,126 @@ def embed_metadata(filepath: Path, metadata: dict, track_num: int, title: str) -
             audio.add_tags()
 
         audio.tags.add(TIT2(encoding=3, text=[title]))
-        audio.tags.add(TPE1(encoding=3, text=[metadata["artist"]]))
+        audio.tags.add(TPE1(encoding=3, text=[artist or metadata["artist"]]))
         audio.tags.add(TALB(encoding=3, text=[metadata["album"]]))
         audio.tags.add(TRCK(encoding=3, text=[str(track_num)]))
         audio.save()
         return True
     except Exception:
         return False
+
+
+# ─── Lyrics (LRCLIB) ──────────────────────────────────────────────
+
+def _lrclib_lookup(title: str, artist: str, album: str | None = None,
+                   duration: float | None = None) -> tuple[str | None, str | None]:
+    """Search LRCLIB for lyrics. Returns (plain, synced) — both may be None."""
+    def query(params: dict) -> list:
+        url = "https://lrclib.net/api/search?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "albumdown/1.0 (+https://github.com/Karataso/albumdown)"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data if isinstance(data, list) else []
+
+    try:
+        results = query({"track_name": title, "artist_name": artist})
+    except Exception:
+        results = []
+    if not results:
+        try:
+            results = query({"q": f"{title} {artist}"})
+        except Exception:
+            return None, None
+
+    # Score candidates — prefer duration/artist/album matches and synced lyrics
+    candidates = []
+    for r in results:
+        if r.get("instrumental"):
+            continue
+        plain, synced = r.get("plainLyrics"), r.get("syncedLyrics")
+        if not plain and not synced:
+            continue
+        score = 0
+        rd = r.get("duration")
+        if duration and rd:
+            diff = abs(float(rd) - float(duration))
+            if diff > 15:
+                continue  # probably a different song
+            score += 4 if diff <= 2 else (3 if diff <= 5 else 1)
+        r_artist = (r.get("artistName") or "").lower()
+        a = artist.lower()
+        if r_artist and (r_artist == a or a in r_artist or r_artist in a):
+            score += 2
+        if synced:
+            score += 2
+        if album and r.get("albumName") and album.lower() in r["albumName"].lower():
+            score += 1
+        candidates.append((score, plain, synced))
+
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda c: -c[0])
+    return candidates[0][1], candidates[0][2]
+
+
+def _embed_lyrics(filepath: Path, text: str) -> None:
+    """Embed plain lyrics as an ID3 USLT frame."""
+    try:
+        audio = MP3(str(filepath), ID3=ID3)
+    except ID3NoHeaderError:
+        return
+    if audio.tags is None:
+        return
+    audio.tags.delall("USLT")
+    audio.tags.add(USLT(encoding=3, lang="eng", desc="", text=text))
+    audio.save()
+
+
+def _needs_lyrics(mp3_path: Path) -> bool:
+    """True if the file has neither a .lrc sidecar nor embedded lyrics."""
+    if mp3_path.with_suffix(".lrc").exists():
+        return False
+    try:
+        audio = MP3(str(mp3_path), ID3=ID3)
+        if audio.tags and audio.tags.getall("USLT"):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def fetch_and_store_lyrics(mp3_path: Path, title: str, artist: str,
+                            album: str | None, duration: float | None,
+                            safe: bool = False) -> bool:
+    """Fetch lyrics from LRCLIB and write them (.lrc sidecar + ID3 USLT).
+
+    Returns True if anything was written."""
+    plain, synced = _lrclib_lookup(title, artist, album, duration)
+    time.sleep(2 if safe else 0.5)  # be polite to LRCLIB
+
+    if not plain and not synced:
+        return False
+    if not plain and synced:
+        # Derive plain text by stripping [mm:ss.xx] timestamps
+        plain = re.sub(r"^\[[^\]]+\]\s*", "", synced, flags=re.MULTILINE)
+
+    wrote = False
+    if synced:
+        try:
+            mp3_path.with_suffix(".lrc").write_text(synced.strip() + "\n", encoding="utf-8")
+            wrote = True
+        except Exception:
+            pass
+    if plain:
+        try:
+            _embed_lyrics(mp3_path, plain)
+            wrote = True
+        except Exception:
+            pass
+    return wrote
 
 
 # ─── Download ─────────────────────────────────────────────────────
@@ -271,11 +435,14 @@ def download_album(
     quality: int = 0,
     safe: bool = False,
     cookies: str | None = None,
+    lyrics: bool = False,
 ) -> dict:
     """Download all tracks. Returns stats dict."""
     entries = metadata["entries"]
     total = len(entries)
     stats = {"success": 0, "skipped": 0, "failed": 0, "failed_tracks": []}
+    if lyrics:
+        stats["lyrics"] = 0
 
     total_done = 0
 
@@ -301,6 +468,11 @@ def download_album(
                 progress.update(dl_task, advance=1)
                 continue
 
+            # Track number from playlist metadata (see fetch_metadata)
+            pi = entry.get("playlist_index")
+            if isinstance(pi, int) and pi >= 1:
+                track_num = pi
+
             title = entry.get("title") or entry.get("fulltitle") or f"Track {track_num}"
             entry_url = entry.get("url") or entry.get("webpage_url")
             if not entry_url:
@@ -313,11 +485,24 @@ def download_album(
                     progress.update(dl_task, advance=1)
                     continue
 
+            # Per-song artist (differs from album artist on compilations)
+            entry_artist = _entry_artist(entry) or metadata["artist"]
+
             # Check if file already exists
             safe_title = _sanitize(title)
             expected_file = album_dir / f"{track_num:02d}. {safe_title}.mp3"
             if expected_file.exists():
                 stats["skipped"] += 1
+                # Still backfill lyrics for existing files (so --lyrics
+                # can be run on an album that's already downloaded)
+                if lyrics and _needs_lyrics(expected_file):
+                    progress.update(dl_task, description=f"[{track_num}/{total}] Lyrics — {title[:40]}")
+                    try:
+                        if fetch_and_store_lyrics(expected_file, title, entry_artist,
+                                                  metadata["album"], entry.get("duration"), safe):
+                            stats["lyrics"] += 1
+                    except Exception:
+                        pass
                 progress.update(dl_task, advance=1)
                 continue
 
@@ -395,10 +580,21 @@ def download_album(
 
                     # Embed metadata
                     if final_mp3.exists():
-                        embed_metadata(final_mp3, metadata, track_num, title)
+                        embed_metadata(final_mp3, metadata, track_num, title, entry_artist)
 
                     stats["success"] += 1
                     downloaded = True
+
+                    # Lyrics
+                    if lyrics and final_mp3.exists():
+                        progress.update(dl_task, description=f"[{track_num}/{total}] Lyrics — {title[:40]}")
+                        try:
+                            if fetch_and_store_lyrics(final_mp3, title, entry_artist,
+                                                      metadata["album"], entry.get("duration"), safe):
+                                stats["lyrics"] += 1
+                        except Exception:
+                            pass
+
                     break
 
                 except Exception as e:
@@ -447,6 +643,8 @@ def display_summary(stats: dict, album_dir: Path) -> None:
         lines.append(f"[yellow]● {stats['skipped']} skipped (already existed)[/]")
     if stats["failed"] > 0:
         lines.append(f"[red]✗ {stats['failed']} failed[/]")
+    if "lyrics" in stats:
+        lines.append(f"[magenta]♪ {stats['lyrics']} with lyrics[/]")
 
     summary = " • ".join(lines)
     console.print(summary)
@@ -552,6 +750,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to a cookies.txt file (Netscape format) for authenticated downloads",
     )
+    parser.add_argument(
+        "--lyrics",
+        action="store_true",
+        help="Fetch lyrics from LRCLIB — writes .lrc files and embeds them in the MP3s",
+    )
     return parser.parse_args()
 
 
@@ -601,6 +804,7 @@ def main():
         quality=args.quality,
         safe=args.safe,
         cookies=args.cookies,
+        lyrics=args.lyrics,
     )
     elapsed = time.time() - start
 

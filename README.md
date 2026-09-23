@@ -67,6 +67,8 @@ That's it. First run automatically installs dependencies into a local `.venv/` �
 
 Each MP3 file has ID3 tags embedded: title, artist, album, and track number.
 
+Track numbers come from the playlist order (YouTube Music stores albums as playlists — playlist position *is* the track number), and the folder/artist/album names come from each song's own metadata tags, so names are clean (e.g. `Lámina Once` instead of the raw playlist title `Album - Lámina Once`).
+
 ## Options
 
 | Flag | Description | Default |
@@ -76,7 +78,23 @@ Each MP3 file has ID3 tags embedded: title, artist, album, and track number.
 | `--no-confirm` | Skip the yes/no prompt | off |
 | `--safe` | Slower, gentler downloads (see below) | off |
 | `--cookies FILE` | Use a cookies.txt for authenticated downloads | none |
+| `--lyrics` | Fetch and archive lyrics (see below) | off |
 | `-h, --help` | Show help | — |
+
+## Lyrics
+
+```bash
+./albumdown "URL" --lyrics
+```
+
+Fetches lyrics from [LRCLIB](https://lrclib.net) (free, no API key) and archives them two ways:
+
+- `01. Song Title.lrc` — sidecar file with synced timestamps (read by mpv, foobar2000, most Android players)
+- Lyrics embedded in the MP3's ID3 tags (shows in any player's lyrics view)
+
+Matching is duration- and artist-aware to avoid attaching wrong-song lyrics. You can also run it on an album you've already downloaded — it backfills missing lyrics without re-downloading anything.
+
+> Why not Musixmatch? Their free API tier only returns 30% lyric snippets; full lyrics require a paid license. LRCLIB is free and complete.
 
 ## Safe Mode
 
