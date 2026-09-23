@@ -172,6 +172,16 @@ def fetch_metadata(url: str) -> dict:
                 or "Unknown Artist"
             )
 
+        # The catalog merges distributor feeds that disagree on
+        # capitalization ("El Cuarteto De Nos" vs "El Cuarteto de Nos").
+        # Unify to the most common spelling within this album;
+        # make_output_dir() handles the cross-album case.
+        canonical = _most_common_case([a for a in (_entry_artist(e) for e in valid) if a])
+        if canonical and canonical.casefold() == artist.casefold():
+            artist = canonical
+            for e in valid:
+                _rewrite_entry_artist(e, canonical)
+
     valid_entries = [e for e in entries if e is not None]
 
     # YouTube Music has no track-number field (its "track" key holds the
@@ -239,6 +249,45 @@ def _entry_artist(entry: dict) -> str:
     return ""
 
 
+def _most_common_case(names: list[str]) -> str | None:
+    """Most frequent capitalization among case-insensitive variants."""
+    groups: dict[str, list[str]] = {}
+    for n in names:
+        if n:
+            groups.setdefault(n.casefold(), []).append(n)
+    if not groups:
+        return None
+    # Most-occurring spelling group wins; ties go to the group seen first,
+    # and inside it to the variant seen first — fully deterministic
+    best = max(groups.values(), key=len)
+    return max(best, key=lambda v: (best.count(v), -best.index(v)))
+
+
+def _rewrite_entry_artist(entry: dict, canonical: str) -> None:
+    """Rewrite case-variant artist fields in an entry to the canonical spelling."""
+    key = canonical.casefold()
+    arts = entry.get("artists")
+    if isinstance(arts, list):
+        entry["artists"] = [
+            canonical if isinstance(a, str) and a.casefold() == key else a
+            for a in arts
+        ]
+    for f in ("artist", "creator"):
+        v = entry.get(f)
+        if isinstance(v, str):
+            head = v.split(",")[0]
+            if head.strip().casefold() == key:
+                entry[f] = canonical + v[len(head):]
+
+
+def _apply_artist_case(metadata: dict, canonical: str) -> None:
+    """Unify artist casing in metadata and every entry (folder name AND
+    embedded tags must agree, or players still split the artist)."""
+    metadata["artist"] = canonical
+    for e in metadata.get("entries") or []:
+        _rewrite_entry_artist(e, canonical)
+
+
 # ─── Display ──────────────────────────────────────────────────────
 
 def format_duration(seconds: int | float | None) -> str:
@@ -296,6 +345,23 @@ def _sanitize(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|]', "_", name)
     name = re.sub(r"_+", "_", name).strip("_. ")
     return name or "Unknown"
+
+
+def _merge_artist_folder(metadata: dict, base: Path) -> None:
+    """Merge case-variant artist folders. YouTube's catalog disagrees on
+    capitalization between albums, so previous runs may have created
+    "El Cuarteto de Nos" while this run wants "...De Nos". Adopt the
+    existing folder's spelling — in the folder name AND the embedded
+    tags — so players see ONE artist, not two. Creates nothing."""
+    artist = metadata.get("artist") or ""
+    if not base.is_dir():
+        return
+    key = artist.casefold()
+    for p in sorted(base.iterdir()):
+        if p.is_dir() and p.name.casefold() == key:
+            if p.name != artist:
+                _apply_artist_case(metadata, p.name)
+            return
 
 
 def make_output_dir(metadata: dict, output_base: str) -> Path:
@@ -887,6 +953,10 @@ def main():
     if not metadata["entries"]:
         console.print("[bold red]Error:[/] No tracks found in this playlist.")
         sys.exit(1)
+
+    # Adopt an existing case-variant artist folder before showing anything,
+    # so the header, folder and embedded tags all use one spelling
+    _merge_artist_folder(metadata, Path(output_base))
 
     # Display tracklist
     display_tracklist(metadata)
