@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-albumdown — Download entire YouTube Music albums as MP3s.
+albumdown — Download YouTube Music albums (or a full artist discography) as MP3s.
 
 Usage:
     albumdown <URL> [options]       (Linux/macOS)
@@ -9,9 +9,12 @@ Usage:
 Examples:
     albumdown "https://music.youtube.com/playlist?list=PLxxxxx"
     albumdown "https://youtube.com/playlist?list=PLxxxxx" -o ~/Downloads
+    albumdown "https://music.youtube.com/channel/UCxxxxx" --all
+    albumdown "@artisthandle"
 """
 
 import argparse
+import http.cookiejar
 import json
 import os
 import platform
@@ -78,7 +81,7 @@ from rich.progress import (
     MofNCompleteColumn,
 )
 from rich.panel import Panel
-from rich.prompt import Confirm
+from rich.prompt import Confirm, Prompt
 from rich.text import Text
 from rich import box
 from mutagen.mp3 import MP3
@@ -95,24 +98,362 @@ YOUTUBE_PLAYLIST_RE = re.compile(
 )
 
 
+ARTIST_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:music\.)?youtube\.com/"
+    r"(?:"
+    r"(?:channel/|c/|user/)(?P<id>[A-Za-z0-9_.-]{1,60})"
+    r"|(?P<handle>@[A-Za-z0-9_.-]{1,60})"
+    r")"
+)
+
+
 def validate_url(url: str) -> str | None:
     """Extract playlist ID from a YouTube/Music URL. Returns None if invalid."""
     m = YOUTUBE_PLAYLIST_RE.search(url)
     return m.group(1) if m else None
 
 
-def is_album_url(url: str) -> bool:
-    return validate_url(url) is not None
+def classify_url(url: str) -> tuple[str, str] | None:
+    """Decide what kind of thing we were handed.
+
+    Returns ("playlist", playlist_id) for a single album,
+             ("artist", identifier)   for a whole artist (channel / @handle),
+             None                     for anything else."""
+    playlist_id = validate_url(url)
+    if playlist_id:
+        return "playlist", playlist_id
+    if url.strip().startswith("@"):  # bare handle: albumdown "@artist"
+        return "artist", url.strip()
+    m = ARTIST_URL_RE.search(url)
+    if m:
+        return "artist", m.group("id") or m.group("handle")
+    return None
+
+
+# ─── Artist Catalog (YouTube Music innertube) ─────────────────────
+#
+# YouTube Music has no public API, but its artist pages are served by the
+# same "innertube" endpoint yt-dlp talks to for playback. We borrow yt-dlp's
+# own client config (kept current by upstream) and ask it for the artist's
+# "Albums" / "Singles & EPs" shelves — every release arrives with its type,
+# year and the OLAK… playlist id, which is exactly what fetch_metadata()
+# already knows how to download.
+
+INNERTUBE_BROWSE_URL = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false"
+YTM_INNERTUBE_CONTEXT = {
+    "client": {"clientName": "WEB_REMIX", "clientVersion": "1.20250101.01.00", "hl": "en"}
+}
+# YouTube's own product codes for the WEB_REMIX client (stable)
+YTM_CLIENT_NAME_CODE = "67"
+
+_SHELF_HEADER_RENDERERS = (
+    "musicImmersiveHeaderRenderer",
+    "musicVisualHeaderRenderer",
+    "musicDetailHeaderRenderer",
+    "musicResponsiveHeaderRenderer",
+)
+_MIX_PLAYLIST_PREFIXES = ("RD", "UL", "FL", "LL")  # auto-generated mixes, not releases
+_SINGLE_KINDS = ("single", "ep")
+_KNOWN_RELEASE_KINDS = ("album", "single", "ep", "compilation", "live", "remix")
+_RELEASE_SHELF_RE = re.compile(r"\b(albums?|singles?|eps?|discograph\w*)\b", re.IGNORECASE)
+
+
+def _innertube_contexts() -> list[dict]:
+    """Client configs to try, newest first — yt-dlp's own if we can reach it."""
+    contexts = []
+    try:
+        from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS
+        ctx = INNERTUBE_CLIENTS["web_music"]["INNERTUBE_CONTEXT"]
+        if isinstance(ctx, dict) and ctx.get("client", {}).get("clientName"):
+            contexts.append(ctx)
+    except Exception:
+        pass
+    contexts.append(YTM_INNERTUBE_CONTEXT)
+    return contexts
+
+
+def _http_opener(cookies: str | None = None) -> urllib.request.OpenerDirector:
+    """urllib opener, optionally carrying the user's cookies.txt — so
+    --cookies covers artist-page reads too, not just the downloads."""
+    if not cookies:
+        return urllib.request.build_opener()
+    jar = http.cookiejar.MozillaCookieJar(cookies)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except Exception:
+        return urllib.request.build_opener()
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+
+def _innertube_browse(
+    browse_id: str, params: str | None = None, opener=None
+) -> dict | None:
+    """Fetch a YouTube Music page (artist channel, album, "see all" grid).
+
+    Returns the parsed response, or None when YouTube shrugs at us."""
+    opener = opener or _http_opener()
+    tried_versions = set()
+    for ctx in _innertube_contexts():
+        version = ctx["client"].get("clientVersion")
+        if version in tried_versions:  # identical configs — don't repeat ourselves
+            continue
+        tried_versions.add(version)
+
+        body = {"context": ctx, "browseId": browse_id}
+        if params:
+            body["params"] = params
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+            "X-Youtube-Client-Name": YTM_CLIENT_NAME_CODE,
+            "X-Youtube-Client-Version": version or "",
+        }
+        try:
+            req = urllib.request.Request(
+                INNERTUBE_BROWSE_URL,
+                data=json.dumps(body).encode("utf-8"),
+                headers=headers,
+            )
+            with opener.open(req, timeout=25) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, dict) and data:
+                return data
+        except Exception:
+            continue
+    return None
+
+
+def resolve_artist_channel(url: str, opener=None) -> str | None:
+    """Turn an artist URL into a UC… channel id.
+
+    Direct channel links are already ids; @handles and custom URLs need one
+    cheap fetch of the channel page (music.youtube.com is a JS shell, so we
+    ask www.youtube.com instead)."""
+    m = re.search(r"youtube\.com/channel/(UC[\w-]{22})", url)
+    if m:
+        return m.group(1)
+
+    target = url.strip()
+    if target.startswith("@"):
+        target = "https://www.youtube.com/" + target
+    else:
+        target = re.sub(r"^https?://music\.youtube\.com", "https://www.youtube.com", target)
+        if not target.startswith("http"):
+            target = "https://www.youtube.com/" + target
+
+    try:
+        req = urllib.request.Request(target, headers={"User-Agent": "Mozilla/5.0"})
+        with (opener or _http_opener()).open(req, timeout=20) as resp:
+            html = resp.read().decode("utf-8", "ignore")
+    except Exception:
+        return None
+
+    for pattern in (
+        r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[\w-]{22})"',
+        r'"externalId":"(UC[\w-]{22})"',
+        r'"channelId":"(UC[\w-]{22})"',
+    ):
+        m = re.search(pattern, html)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _walk(node):
+    """Depth-first walk over an innertube JSON tree, yielding every dict."""
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _walk(value)
+
+
+def _runs_text(node) -> str:
+    """Text of a `{"runs": [...]}` / `{"simpleText": ...}` node."""
+    if isinstance(node, dict):
+        if isinstance(node.get("runs"), list):
+            return "".join(r.get("text", "") for r in node["runs"])
+        return node.get("simpleText") or ""
+    return ""
+
+
+def _playlist_id_in(node) -> str | None:
+    """First real playlist id inside a node — skips auto-generated mixes
+    (RD…/UL…), which would download a shuffle instead of the release."""
+    if node is None:
+        return None
+    for d in _walk(node):
+        endpoint = d.get("watchPlaylistEndpoint")
+        if not isinstance(endpoint, dict):
+            nav = d.get("navigationEndpoint")
+            endpoint = nav.get("watchPlaylistEndpoint") if isinstance(nav, dict) else None
+        if isinstance(endpoint, dict):
+            playlist_id = endpoint.get("playlistId")
+            if isinstance(playlist_id, str) and not playlist_id.startswith(_MIX_PLAYLIST_PREFIXES):
+                return playlist_id
+    return None
+
+
+def _release_kind(subtitle: str, shelf_title: str) -> str:
+    """Album / single / EP / compilation… from the item's subtitle, falling
+    back to the shelf it came from ('Albums' vs 'Singles & EPs')."""
+    head = subtitle.split("•")[0].strip().lower() if subtitle else ""
+    if head in _KNOWN_RELEASE_KINDS:
+        return head
+    shelf = (shelf_title or "").lower()
+    if "album" in shelf:
+        return "album"
+    if "single" in shelf or re.search(r"\bep", shelf):
+        return "single"
+    return "album"
+
+
+def _release_year(subtitle: str) -> str:
+    m = re.search(r"\b((?:19|20)\d{2})\b", subtitle or "")
+    return m.group(1) if m else ""
+
+
+def _release_from_item(item: dict, shelf_title: str) -> dict | None:
+    """Pull a release out of a shelf/grid card (two kinds of renderer exist)."""
+    two_row = item.get("musicTwoRowItemRenderer")
+    responsive = item.get("musicResponsiveListItemRenderer")
+    browse_id = None
+    if isinstance(two_row, dict):
+        title = _runs_text(two_row.get("title"))
+        subtitle = _runs_text(two_row.get("subtitle"))
+        endpoint = two_row.get("navigationEndpoint") or {}
+        browse_id = (endpoint.get("browseEndpoint") or {}).get("browseId")
+    elif isinstance(responsive, dict):
+        columns = [_runs_text(c.get("text")) for c in responsive.get("flexColumns") or []]
+        title = columns[0] if columns else ""
+        subtitle = " • ".join(c for c in columns[1:] if c)
+    else:
+        return None
+
+    if not title:
+        return None
+    thumbnail = None
+    for d in _walk(item):
+        thumbs = ((d.get("musicThumbnailRenderer") or {}).get("thumbnail") or {}).get("thumbnails")
+        if thumbs:
+            thumbnail = thumbs[-1].get("url")  # largest variant
+            break
+
+    return {
+        "title": title,
+        "kind": _release_kind(subtitle, shelf_title),
+        "year": _release_year(subtitle),
+        "playlist_id": _playlist_id_in(item),
+        "browse_id": browse_id,
+        "thumbnail": thumbnail,
+    }
+
+
+def _release_shelves(page: dict) -> list[dict]:
+    """Every carousel shelf on an artist page: title, 'see all' endpoint, items."""
+    shelves = []
+    for d in _walk(page):
+        shelf = d.get("musicCarouselShelfRenderer")
+        if not isinstance(shelf, dict):
+            continue
+        header = shelf.get("header") or {}
+        header = header.get("musicCarouselShelfBasicHeaderRenderer") or header
+        title_node = header.get("title")
+        title = _runs_text(title_node)
+        runs = title_node.get("runs") if isinstance(title_node, dict) else None
+        endpoint = (runs[0].get("navigationEndpoint") or {}) if runs else {}
+        browse = endpoint.get("browseEndpoint") or {}
+        shelves.append({
+            "title": title,
+            "browse_id": browse.get("browseId"),
+            "params": browse.get("params"),
+            "items": [c for c in (shelf.get("contents") or []) if isinstance(c, dict)],
+        })
+    return shelves
+
+
+def fetch_artist_catalog(url: str, cookies: str | None = None) -> dict | None:
+    """Read a YouTube Music artist page: artist name + every release.
+
+    Returns {"artist": str, "releases": [...]} or None if the page can't be
+    read (bad URL, bot check, network hiccup)."""
+    opener = _http_opener(cookies)
+    channel = resolve_artist_channel(url, opener)
+    if not channel:
+        return None
+    page = _innertube_browse(channel, opener=opener)
+    if not page:
+        return None
+
+    # Artist name lives in the page header (immersive for real artists)
+    artist = ""
+    for d in _walk(page):
+        for key in _SHELF_HEADER_RENDERERS:
+            if isinstance(d.get(key), dict):
+                artist = _runs_text(d[key].get("title"))
+                if artist:
+                    break
+        if artist:
+            break
+
+    releases: list[dict] = []
+    seen_titles: set[str] = set()
+    seen_playlists: set[str] = set()
+    for shelf in _release_shelves(page):
+        if not _RELEASE_SHELF_RE.search(shelf["title"] or ""):
+            continue  # Videos / Featured on / Playlists / Fans might also like…
+        items = shelf["items"]
+        if shelf["browse_id"]:
+            # The shelf on the artist page is a teaser — follow "see all" for
+            # the complete album/singles list.
+            full = _innertube_browse(shelf["browse_id"], shelf["params"], opener=opener)
+            if full:
+                items = [
+                    d for d in _walk(full)
+                    if "musicTwoRowItemRenderer" in d or "musicResponsiveListItemRenderer" in d
+                ] or items
+
+        for raw in items:
+            release = _release_from_item(raw, shelf["title"])
+            if not release:
+                continue
+            # Shelves overlap: the same release often shows up as an album
+            # and again under singles, sometimes under two playlist ids.
+            # One row per title+year keeps the picker honest.
+            title_key = f'{release["title"].casefold()}|{release["year"]}'
+            if title_key in seen_titles:
+                continue
+            if release["playlist_id"] and release["playlist_id"] in seen_playlists:
+                continue
+            if not release["playlist_id"] and release["browse_id"]:
+                # Rare: card without a direct playlist — open the album page
+                album_page = _innertube_browse(release["browse_id"], opener=opener)
+                release["playlist_id"] = _playlist_id_in(album_page)
+            if not release["playlist_id"]:
+                continue
+            seen_titles.add(title_key)
+            seen_playlists.add(release["playlist_id"])
+            releases.append(release)
+
+    return {"artist": artist or "Unknown Artist", "channel": channel, "releases": releases}
 
 
 # ─── Metadata Extraction ──────────────────────────────────────────
 
-def fetch_metadata(url: str) -> dict:
-    """Fetch playlist metadata without downloading anything."""
+def fetch_metadata(url: str, flat: bool = False, fatal: bool = True) -> dict | None:
+    """Fetch playlist metadata without downloading anything.
+
+    flat=True  → one request for the whole playlist instead of one per track.
+                 Loses the per-entry tags, so the caller must supply album and
+                 artist names (the discography catalog already has them).
+    fatal=True → bail out of the program on failure (single-album mode);
+                 return None instead so a full-artist run can skip it."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "extract_flat": False,
+        "extract_flat": "in_playlist" if flat else False,
         "skip_download": True,
     }
 
@@ -120,11 +461,15 @@ def fetch_metadata(url: str) -> dict:
         try:
             info = ydl.extract_info(url, download=False)
         except yt_dlp.utils.DownloadError as e:
+            if not fatal:
+                return None
             console.print("[bold red]Error:[/] Could not fetch playlist info.")
             console.print(f"[dim]{e}[/]")
             sys.exit(1)
 
     if not info:
+        if not fatal:
+            return None
         console.print("[bold red]Error:[/] No metadata returned.")
         sys.exit(1)
 
@@ -141,46 +486,55 @@ def fetch_metadata(url: str) -> dict:
         entries = list(info.get("entries", []))
         valid = [e for e in entries if e is not None]
 
-        # Album: the per-entry tag is cleaner than the playlist title
-        # (YouTube Music titles often come prefixed: "Album - Lámina Once")
-        album_name = ""
-        for e in valid:
-            if e.get("album"):
-                album_name = _clean_album(e["album"])
-                break
-        if not album_name:
-            album_name = _clean_playlist_title(info.get("title", "Unknown Album"))
-
-        # Artist: per-entry tag first, then playlist uploader/channel
-        artist = ""
-        for e in valid:
-            artist = _entry_artist(e)
-            if artist:
-                break
-        if not artist:
+        if flat:
+            # One request, no per-entry tags: the playlist's own title and
+            # uploader stand in until the discography catalog overrides them.
+            # _clean_playlist_title strips YouTube's "Album - " prefixes.
+            album_name = _clean_playlist_title(info.get("title", ""))
             artist = _clean_artist(
-                info.get("uploader")
-                or info.get("channel")
-                or ""
+                info.get("uploader") or info.get("channel") or "Unknown Artist"
             )
-        # Fallback: try first entry's uploader
-        if not artist or artist.lower() in ("unknown artist", ""):
-            first = valid[0] if valid else {}
-            artist = _clean_artist(
-                first.get("uploader")
-                or first.get("channel")
-                or "Unknown Artist"
-            )
-
-        # The catalog merges distributor feeds that disagree on
-        # capitalization ("El Cuarteto De Nos" vs "El Cuarteto de Nos").
-        # Unify to the most common spelling within this album;
-        # make_output_dir() handles the cross-album case.
-        canonical = _most_common_case([a for a in (_entry_artist(e) for e in valid) if a])
-        if canonical and canonical.casefold() == artist.casefold():
-            artist = canonical
+        else:
+            # Album: the per-entry tag is cleaner than the playlist title
+            # (YouTube Music titles often come prefixed: "Album - Lámina Once")
+            album_name = ""
             for e in valid:
-                _rewrite_entry_artist(e, canonical)
+                if e.get("album"):
+                    album_name = _clean_album(e["album"])
+                    break
+            if not album_name:
+                album_name = _clean_playlist_title(info.get("title", "Unknown Album"))
+
+            # Artist: per-entry tag first, then playlist uploader/channel
+            artist = ""
+            for e in valid:
+                artist = _entry_artist(e)
+                if artist:
+                    break
+            if not artist:
+                artist = _clean_artist(
+                    info.get("uploader")
+                    or info.get("channel")
+                    or ""
+                )
+            # Fallback: try first entry's uploader
+            if not artist or artist.lower() in ("unknown artist", ""):
+                first = valid[0] if valid else {}
+                artist = _clean_artist(
+                    first.get("uploader")
+                    or first.get("channel")
+                    or "Unknown Artist"
+                )
+
+            # The catalog merges distributor feeds that disagree on
+            # capitalization ("El Cuarteto De Nos" vs "El Cuarteto de Nos").
+            # Unify to the most common spelling within this album;
+            # make_output_dir() handles the cross-album case.
+            canonical = _most_common_case([a for a in (_entry_artist(e) for e in valid) if a])
+            if canonical and canonical.casefold() == artist.casefold():
+                artist = canonical
+                for e in valid:
+                    _rewrite_entry_artist(e, canonical)
 
     valid_entries = [e for e in entries if e is not None]
 
@@ -337,6 +691,92 @@ def display_tracklist(metadata: dict) -> None:
 
     console.print(table)
     console.print()
+
+
+# ─── Release Picker (full-artist mode) ────────────────────────────
+
+def display_release_catalog(catalog: dict, include_singles: bool) -> list[dict]:
+    """Show the discography and return the releases worth offering."""
+    releases = catalog["releases"]
+    albums = [r for r in releases if r["kind"] not in _SINGLE_KINDS]
+    singles = [r for r in releases if r["kind"] in _SINGLE_KINDS]
+    shown = releases if include_singles else albums
+
+    header = Text()
+    header.append("🎤 ", style="bold")
+    header.append(catalog["artist"], style="bold cyan")
+    header.append(" — full discography", style="dim")
+    header.append(
+        f"\n   {len(albums)} album{'s' if len(albums) != 1 else ''}"
+        f" • {len(singles)} single{'' if len(singles) == 1 else 's'}"
+        f"{'/EP' if len(singles) == 1 else ' & EPs'}"
+        f" • {len(shown)} shown",
+        style="dim",
+    )
+    console.print()
+    console.print(Panel(header, border_style="blue", box=box.ROUNDED))
+
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold green", padding=(0, 1))
+    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("Type", style="magenta", width=13)
+    table.add_column("Year", style="dim", width=5, justify="right")
+    table.add_column("Release", style="white", ratio=3)
+
+    for i, release in enumerate(shown, 1):
+        kind = "EP" if release["kind"] == "ep" else release["kind"].title()
+        table.add_row(f"{i:02d}", kind, release["year"] or "—", release["title"])
+    console.print(table)
+    console.print()
+
+    if singles and not include_singles:
+        console.print(
+            f"[dim]{len(singles)} singles & EPs hidden — add --include-singles to pick them too[/]"
+        )
+        console.print()
+
+    return shown
+
+
+def _parse_selection(text: str, count: int) -> list[int] | None:
+    """'1-4, 7' → [1,2,3,4,7] · 'all'/'' → everything · 'q' → None (quit)."""
+    raw = (text or "").strip().lower()
+    if raw in ("", "all", "a", "*"):
+        return list(range(1, count + 1))
+    if raw in ("q", "quit", "none", "n", "0"):
+        return None
+
+    picked: set[int] = set()
+    for part in raw.replace(" ", "").split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        first = int(lo)  # ValueError → caller re-asks
+        last = int(hi) if _ else first
+        if not (1 <= first <= last <= count):
+            raise ValueError(part)
+        picked.update(range(first, last + 1))
+    if not picked:
+        raise ValueError(text)
+    return sorted(picked)
+
+
+def ask_release_selection(count: int) -> list[int]:
+    """Prompt until the user picks 1-based indices (empty = none chosen)."""
+    while True:
+        answer = Prompt.ask(
+            "[bold]Which releases?[/] "
+            "[dim](e.g. 1-4, 7, all · Enter = all · q = quit)[/]",
+            default="all",
+        )
+        try:
+            selection = _parse_selection(answer, count)
+        except ValueError:
+            console.print("[red]Couldn't read that — use numbers or ranges like 1-3.[/]")
+            continue
+        if selection is None:
+            console.print("[dim]Cancelled.[/]")
+            sys.exit(0)
+        return selection
 
 
 # ─── File System ──────────────────────────────────────────────────
@@ -565,7 +1005,113 @@ def embed_art(filepath: Path, image: bytes, mime: str = "image/jpeg") -> bool:
         return False
 
 
+# ─── Failure Handling ─────────────────────────────────────────────
+#
+# YouTube fails in three very different ways, and retrying them all the
+# same way is exactly why you end up re-running the program by hand:
+#
+#   block      403 / "Sign in to confirm you're not a bot". A transient
+#              bot check — waiting a little and trying again usually works
+#              (that's what re-running already proves), but only a few
+#              times: past that we're just hammering.
+#   gone       private, deleted, geo-blocked. No amount of waiting will
+#              resurrect it, so fail the track and move on immediately.
+#   transient  timeouts, connection resets, 5xx. Normal short backoff.
+
+_BLOCK_MARKERS = (
+    "sign in to confirm",
+    "not a bot",
+    "403: forbidden",
+    "http error 403",
+    "http error 429",
+    "too many requests",
+    "cookies are no longer valid",
+    "please sign in",
+    "login required",
+)
+_GONE_MARKERS = (
+    "video unavailable",
+    "is unavailable",
+    "video is private",
+    "has been removed",
+    "available in your country",
+    "account associated with this video",
+    "uploader has closed",
+    "no longer available",
+    "confirm your age",
+    "is not available",
+    "copyright",
+)
+
+_RETRY_POLICY = {
+    "block": {"tries": 3, "base": 30, "cap": 120},   # 30s → 60s → 120s
+    "transient": {"tries": 6, "base": 2, "cap": 30},  # 2s → … → 30s
+    "gone": {"tries": 0, "base": 0, "cap": 0},
+}
+_FAILURE_LABEL = {
+    "block": "403 — YouTube is checking us",
+    "transient": "network hiccup",
+}
+_FAILURE_NOTE = {
+    "block": "blocked, try again in a bit",
+    "gone": "unavailable",
+    "transient": "gave up after retries",
+}
+
+
+def classify_failure(error: Exception) -> str:
+    """Sort an error into 'block' | 'gone' | 'transient' (see above)."""
+    text = str(error).lower()
+    if any(marker in text for marker in _BLOCK_MARKERS):
+        return "block"
+    if any(marker in text for marker in _GONE_MARKERS):
+        return "gone"
+    return "transient"
+
+
+def _retry_wait(kind: str, attempt: int) -> int:
+    """Seconds to wait before retry `attempt` (0-based) of that kind."""
+    policy = _RETRY_POLICY[kind]
+    return min(policy["base"] * (2 ** attempt), policy["cap"])
+
+
 # ─── Download ─────────────────────────────────────────────────────
+
+def _fetch_track(
+    entry_url: str,
+    ydl_opts: dict,
+    album_dir: Path,
+    track_num: int,
+    safe_title: str,
+    metadata: dict,
+    title: str,
+    entry_artist: str,
+) -> Path:
+    """Download, convert and tag one track — returns its final path.
+
+    Raises on any failure, *including* the silent one: yt-dlp can report an
+    error and still return normally, so the file on disk is the only proof
+    of success we trust. Callers classify the error and decide what to do."""
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([entry_url])
+
+    final_mp3 = album_dir / f"{track_num:02d}. {safe_title}.mp3"
+    tmp_mp3 = album_dir / f"__tmp_{track_num}__.mp3"
+
+    if tmp_mp3.exists():
+        tmp_mp3.rename(final_mp3)
+    else:
+        # yt-dlp might have named it differently — find it
+        candidates = list(album_dir.glob(f"__tmp_{track_num}*.mp3"))
+        if candidates:
+            candidates[0].rename(final_mp3)
+
+    if not final_mp3.exists():
+        raise RuntimeError("yt-dlp finished without producing a file")
+
+    embed_metadata(final_mp3, metadata, track_num, title, entry_artist)
+    return final_mp3
+
 
 def download_album(
     metadata: dict,
@@ -599,6 +1145,9 @@ def download_album(
                     break
 
     total_done = 0
+    # Set the first time YouTube throws a 403 at us — everything after that
+    # runs at a gentler pace instead of asking for trouble again.
+    block_seen = False
 
     with Progress(
         SpinnerColumn(),
@@ -680,7 +1229,10 @@ def download_album(
                 ],
                 "writethumbnail": False,
                 "writeinfojson": False,
-                "ignoreerrors": True,
+                # Failures MUST raise. With ignoreerrors yt-dlp only prints
+                # "ERROR: …" and returns 0, which used to make the retry loop
+                # below count a success for a file that never existed.
+                "ignoreerrors": False,
                 "no_warnings": True,
                 "quiet": True,
                 "noprogress": True,
@@ -714,72 +1266,75 @@ def download_album(
 
             ydl_opts["progress_hooks"] = [make_hook(track_num, total, title, progress, dl_task)]
 
-            # Retry logic with exponential backoff
-            max_retries = 3
+            # Retry policy — see "Failure Handling" above. A track only
+            # counts as downloaded once its file is really on disk.
             downloaded = False
+            failure: Exception | None = None
+            failure_kind = "transient"
+            attempt = 0
 
-            for attempt in range(max_retries):
+            while True:
                 try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([entry_url])
-
-                    # Find the downloaded temp file and rename it
-                    tmp_mp3 = album_dir / f"__tmp_{track_num}__.mp3"
-                    final_mp3 = album_dir / f"{track_num:02d}. {safe_title}.mp3"
-
-                    if tmp_mp3.exists():
-                        tmp_mp3.rename(final_mp3)
-                    else:
-                        # yt-dlp might have named it differently — find it
-                        candidates = list(album_dir.glob(f"__tmp_{track_num}*.mp3"))
-                        if candidates:
-                            candidates[0].rename(final_mp3)
-
-                    # Embed metadata
-                    if final_mp3.exists():
-                        embed_metadata(final_mp3, metadata, track_num, title, entry_artist)
-
-                    stats["success"] += 1
-                    downloaded = True
-
-                    # Lyrics
-                    if lyrics and final_mp3.exists():
-                        progress.update(dl_task, description=f"[{track_num}/{total}] Lyrics — {title[:40]}")
-                        try:
-                            if fetch_and_store_lyrics(final_mp3, title, entry_artist,
-                                                      metadata["album"], entry.get("duration"), safe):
-                                stats["lyrics"] += 1
-                        except Exception:
-                            pass
-
-                    # Cover art — album cover, or this video's own
-                    # thumbnail as a last resort
-                    if art and final_mp3.exists():
-                        cover = album_art
-                        if not cover:
-                            raw = _download_image(entry.get("thumbnail") or "")
-                            cover = _image_normalize(raw) if raw else None
-                        if cover and embed_art(final_mp3, cover[0], cover[1]):
-                            stats["art"] += 1
-
-                    break
-
+                    final_mp3 = _fetch_track(
+                        entry_url, ydl_opts, album_dir, track_num,
+                        safe_title, metadata, title, entry_artist,
+                    )
                 except Exception as e:
+                    failure = e
+                    failure_kind = classify_failure(e)
+                    if failure_kind == "block":
+                        block_seen = True
+
                     # Cleanup temp files before retry
                     for f in album_dir.glob(f"__tmp_{track_num}*"):
                         f.unlink(missing_ok=True)
 
-                    if attempt < max_retries - 1:
-                        # Exponential backoff: 2s, 4s, 8s...
-                        wait = 2 ** (attempt + 1)
-                        progress.update(
-                            dl_task,
-                            description=f"[{track_num}/{total}] Retry {attempt + 1}/{max_retries} in {wait}s — {title[:35]}",
-                        )
-                        time.sleep(wait)
-                    else:
-                        stats["failed"] += 1
-                        stats["failed_tracks"].append(f"{track_num:02d}. {title}")
+                    policy = _RETRY_POLICY[failure_kind]
+                    if failure_kind == "gone" or attempt >= policy["tries"]:
+                        break  # permanently unavailable, or out of retries
+
+                    wait = _retry_wait(failure_kind, attempt)
+                    attempt += 1
+                    progress.update(
+                        dl_task,
+                        description=(
+                            f"[{track_num}/{total}] {_FAILURE_LABEL[failure_kind]}"
+                            f" — retry {attempt}/{policy['tries']} in {wait}s"
+                        ),
+                    )
+                    time.sleep(wait)
+                    continue
+
+                stats["success"] += 1
+                downloaded = True
+
+                # Lyrics
+                if lyrics:
+                    progress.update(dl_task, description=f"[{track_num}/{total}] Lyrics — {title[:40]}")
+                    try:
+                        if fetch_and_store_lyrics(final_mp3, title, entry_artist,
+                                                  metadata["album"], entry.get("duration"), safe):
+                            stats["lyrics"] += 1
+                    except Exception:
+                        pass
+
+                # Cover art — album cover, or this video's own
+                # thumbnail as a last resort
+                if art:
+                    cover = album_art
+                    if not cover:
+                        raw = _download_image(entry.get("thumbnail") or "")
+                        cover = _image_normalize(raw) if raw else None
+                    if cover and embed_art(final_mp3, cover[0], cover[1]):
+                        stats["art"] += 1
+
+                break
+
+            if not downloaded:
+                stats["failed"] += 1
+                stats["failed_tracks"].append(
+                    f"{track_num:02d}. {title} ({_FAILURE_NOTE[failure_kind]})"
+                )
 
             # Delay between tracks to avoid rate limiting
             if downloaded and i < total - 1:
@@ -791,17 +1346,26 @@ def download_album(
                         description=f"⏳ Waiting {wait:.0f}s to avoid bot detection...",
                     )
                     time.sleep(wait)
+                elif block_seen:
+                    # YouTube twitched at us earlier — ease off for the rest
+                    # of the album instead of asking for trouble again.
+                    progress.update(
+                        dl_task,
+                        description="⏳ 403 earlier — waiting 10s before the next track...",
+                    )
+                    time.sleep(10)
                 else:
                     time.sleep(1.5)
 
             progress.update(dl_task, advance=1)
 
+    stats["blocked"] = block_seen
     return stats
 
 
 # ─── Summary ──────────────────────────────────────────────────────
 
-def display_summary(stats: dict, album_dir: Path) -> None:
+def display_summary(stats: dict, location: Path, albums: int = 0) -> None:
     console.print()
     lines = []
     if stats["success"] > 0:
@@ -814,15 +1378,30 @@ def display_summary(stats: dict, album_dir: Path) -> None:
         lines.append(f"[magenta]♪ {stats['lyrics']} with lyrics[/]")
     if stats.get("art"):
         lines.append(f"[cyan]🖼 {stats['art']} with cover art[/]")
+    if albums:
+        lines.append(f"[blue]💿 {albums} album{'s' if albums != 1 else ''}[/]")
 
     summary = " • ".join(lines)
     console.print(summary)
-    console.print(f"[dim]📁 {album_dir}[/]")
+    console.print(f"[dim]📁 {location}[/]")
+
+    if stats.get("failed_albums"):
+        console.print("\n[bold red]Albums that could not be read:[/]")
+        for t in stats["failed_albums"]:
+            console.print(f"  [dim]• {t}[/]")
 
     if stats["failed_tracks"]:
         console.print("\n[bold red]Failed tracks:[/]")
         for t in stats["failed_tracks"]:
             console.print(f"  [dim]• {t}[/]")
+
+    if stats["failed_tracks"] or stats.get("failed_albums"):
+        console.print(
+            "\n[dim]Re-run the same command to retry just these — "
+            "everything already on disk is skipped.[/]"
+        )
+        if stats.get("blocked"):
+            console.print("[dim]Tip: give it a few minutes first, or use --safe.[/]")
 
     console.print()
 
@@ -880,16 +1459,21 @@ def _get_music_dir() -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="albumdown",
-        description="Download entire YouTube Music albums as MP3s.",
+        description="Download YouTube Music albums — or a whole artist's discography — as MP3s.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             '  albumdown "https://music.youtube.com/playlist?list=PLxxxxx"\n'
             '  albumdown "https://youtube.com/playlist?list=PLxxxxx" -o ~/Downloads\n'
-            '  albumdown "https://music.youtube.com/playlist?list=PLxxxxx" --no-confirm'
+            '  albumdown "https://music.youtube.com/channel/UCxxxxx"\n'
+            '  albumdown "@artisthandle" --include-singles\n'
+            '  albumdown "https://music.youtube.com/channel/UCxxxxx" --all --no-confirm'
         ),
     )
-    parser.add_argument("url", help="YouTube Music or YouTube playlist URL")
+    parser.add_argument(
+        "url",
+        help="YouTube/YouTube Music playlist URL, or an artist URL (channel / @handle) for a full discography",
+    )
     parser.add_argument(
         "-o", "--output",
         default=str(_get_music_dir()),
@@ -907,6 +1491,16 @@ def parse_args() -> argparse.Namespace:
         "--no-confirm",
         action="store_true",
         help="Skip the confirmation prompt before downloading",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Artist mode: download every release in scope — skips the picker and the confirmation",
+    )
+    parser.add_argument(
+        "--include-singles",
+        action="store_true",
+        help="Artist mode: offer singles & EPs as well (albums only by default)",
     )
     parser.add_argument(
         "--safe",
@@ -932,20 +1526,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-
-    if not is_album_url(args.url):
-        console.print("[bold red]Error:[/] Invalid URL.")
-        console.print("  Please provide a YouTube or YouTube Music playlist URL.")
-        console.print("  [dim]e.g. https://music.youtube.com/playlist?list=PLxxxxx[/]")
-        sys.exit(1)
-
-    output_base = os.path.expanduser(args.output)
-    if not os.path.isdir(output_base):
-        console.print(f"[bold red]Error:[/] Output directory does not exist: {output_base}")
-        sys.exit(1)
-
+def run_playlist(args: argparse.Namespace, output_base: str) -> None:
+    """Single-album flow: one playlist URL → one album folder."""
     # Fetch metadata
     with console.status("[bold blue]Fetching album info...", spinner="dots"):
         metadata = fetch_metadata(args.url)
@@ -990,6 +1572,144 @@ def main():
     # Summary
     display_summary(stats, album_dir)
     console.print(f"[dim]Finished in {format_duration(elapsed)}[/]")
+
+
+def run_artist(args: argparse.Namespace, output_base: str) -> None:
+    """Full-artist flow: one artist URL → every selected release, album by album."""
+    with console.status("[bold blue]Reading artist page...", spinner="dots"):
+        catalog = fetch_artist_catalog(args.url, cookies=args.cookies)
+
+    if not catalog:
+        console.print("[bold red]Error:[/] Could not read this artist page.")
+        console.print("  [dim]Check the URL — or YouTube may be rate-limiting you (try --cookies).[/]")
+        sys.exit(1)
+    if not catalog["releases"]:
+        console.print("[bold red]Error:[/] No albums or singles found on this channel.")
+        console.print("  [dim]This doesn't look like a YouTube Music artist page.[/]")
+        sys.exit(1)
+
+    # Adopt an existing case-variant artist folder first, so the picker, the
+    # folders and the embedded tags all agree on one spelling
+    probe = {"artist": catalog["artist"], "entries": []}
+    _merge_artist_folder(probe, Path(output_base))
+    catalog["artist"] = probe["artist"]
+    artist_dir = Path(output_base) / _sanitize(catalog["artist"])
+
+    shown = display_release_catalog(catalog, args.include_singles)
+    if not shown:
+        console.print("[bold red]Error:[/] Nothing to download with the current filter.")
+        sys.exit(1)
+
+    if args.all:
+        selected = shown
+    else:
+        selected = [shown[i - 1] for i in ask_release_selection(len(shown))]
+        if not selected:
+            console.print("[dim]Cancelled.[/]")
+            sys.exit(0)
+        if not args.no_confirm and not Confirm.ask(
+            f"[bold]Download {len(selected)} release{'s' if len(selected) != 1 else ''}?",
+            default=True,
+        ):
+            console.print("[dim]Cancelled.[/]")
+            sys.exit(0)
+
+    count = len(selected)
+    console.print(f"\n[bold]📀 {catalog['artist']} — {count} release{'s' if count != 1 else ''}[/]")
+    console.print(f"[dim]📁 {artist_dir}[/]\n")
+
+    totals = {
+        "success": 0, "skipped": 0, "failed": 0,
+        "failed_tracks": [], "failed_albums": [],
+        "lyrics": 0, "art": 0, "blocked": False,
+    }
+    albums_done = 0
+    start = time.time()
+
+    for position, release in enumerate(selected, 1):
+        title = release["title"]
+        year = f" [dim]({release['year']})[/]" if release["year"] else ""
+        console.print(f"[bold cyan]▸ {position}/{count}[/] {title}{year}")
+
+        # Catalog names are the source of truth here: flat extraction fetches
+        # a whole album in one request but carries no per-entry tags.
+        playlist_url = f"https://music.youtube.com/playlist?list={release['playlist_id']}"
+        metadata = fetch_metadata(playlist_url, flat=True, fatal=False)
+        if not metadata or not metadata.get("entries"):
+            totals["failed_albums"].append(title)
+            console.print("  [red]✗ could not read this release — skipping[/]")
+            _album_delay(args.safe, position, count, totals["blocked"])
+            continue
+
+        metadata["album"] = title
+        if catalog["artist"] != "Unknown Artist":
+            metadata["artist"] = catalog["artist"]
+        # Playlist art (1200px) stays first; the shelf thumb is a fallback
+        if release.get("thumbnail") and release["thumbnail"] not in metadata.get("cover_urls", []):
+            metadata["cover_urls"] = metadata.get("cover_urls", []) + [release["thumbnail"]]
+
+        _merge_artist_folder(metadata, Path(output_base))
+        album_dir = make_output_dir(metadata, output_base)
+
+        stats = download_album(
+            metadata, album_dir,
+            quality=args.quality,
+            safe=args.safe,
+            cookies=args.cookies,
+            lyrics=args.lyrics,
+            art=not args.no_art,
+        )
+        for key in ("success", "skipped", "failed", "lyrics", "art"):
+            totals[key] += stats.get(key, 0)
+        totals["blocked"] = totals["blocked"] or bool(stats.get("blocked"))
+        totals["failed_tracks"] += [f"{title} — {t}" for t in stats.get("failed_tracks", [])]
+        albums_done += 1
+
+        _album_delay(args.safe, position, count, totals["blocked"])
+
+    elapsed = time.time() - start
+    display_summary(totals, artist_dir, albums=albums_done)
+    console.print(f"[dim]Finished in {format_duration(elapsed)}[/]")
+
+
+def _album_delay(safe: bool, position: int, count: int, blocked: bool = False) -> None:
+    """Breathe between releases — a discography is many playlists in a row."""
+    if position >= count:
+        return
+    if blocked:
+        # A 403 happened somewhere in this run — give YouTube real room
+        wait = random.uniform(20, 40)
+        console.print(f"[dim]⏳ 403 earlier — waiting {wait:.0f}s before the next album...[/]")
+        time.sleep(wait)
+    elif safe:
+        wait = random.uniform(6, 12)
+        console.print(f"[dim]⏳ Waiting {wait:.0f}s to avoid bot detection...[/]")
+        time.sleep(wait)
+    else:
+        time.sleep(3)
+
+
+def main():
+    args = parse_args()
+
+    kind_target = classify_url(args.url)
+    if not kind_target:
+        console.print("[bold red]Error:[/] Invalid URL.")
+        console.print("  Give a YouTube or YouTube Music playlist URL, or an artist page:")
+        console.print("  [dim]https://music.youtube.com/playlist?list=PLxxxxx[/]")
+        console.print("  [dim]https://music.youtube.com/channel/UCxxxxx · @artisthandle[/]")
+        sys.exit(1)
+
+    output_base = os.path.expanduser(args.output)
+    if not os.path.isdir(output_base):
+        console.print(f"[bold red]Error:[/] Output directory does not exist: {output_base}")
+        sys.exit(1)
+
+    kind, _ = kind_target
+    if kind == "artist":
+        run_artist(args, output_base)
+    else:
+        run_playlist(args, output_base)
 
 
 if __name__ == "__main__":
